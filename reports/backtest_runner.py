@@ -261,12 +261,15 @@ def parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = parse_args()
-    # Final optimized parameters - maximizes trend capture while respecting contest rules
+    # Optimized live trading parameters
     params = {
-        "max_drawdown_exit": 0.48,  # Exit only on catastrophic 48% drawdown (just under 50% limit)
-        "lookback_for_peak": 720,   # 30-day window for peak tracking
+        "short_ma": 96,              # 4-day moving average (reduced whipsaws)
+        "long_ma": 336,              # 14-day moving average (stronger trend)
+        "confirmation_bars": 3,      # Require 3 bars of uptrend before entry
+        "max_drawdown_exit": 0.15,   # Exit on 15% drawdown
+        "lookback_for_peak": 336,    # 14-day peak tracking
         "rebalance_threshold": 0.01,
-        "max_position_pct": 0.55,   # Contest maximum (strictly compliant)
+        "max_position_pct": 0.55,    # Contest maximum
         "min_trade_notional": 200.0,
     }
     results = run_strategy(args.symbols, params)

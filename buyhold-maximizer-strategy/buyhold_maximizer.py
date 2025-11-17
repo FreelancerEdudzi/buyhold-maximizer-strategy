@@ -26,29 +26,37 @@ _EPS = 1e-12
 
 
 class MomentumRotatorStrategy(BaseStrategy):
-    """Simplified near-buy-and-hold: buy immediately, never sell unless catastrophe."""
+    """Adaptive trend-following: Buy in uptrends, exit in downtrends or crashes."""
 
     def __init__(self, config: Dict[str, Any], exchange):
         super().__init__(config=config, exchange=exchange)
         self.max_position_pct = min(0.55, float(config.get("max_position_pct", 0.55)))
         
-        # Only track for extreme exit conditions
-        self.max_drawdown_exit = float(config.get("max_drawdown_exit", 0.40))  # 40% total drawdown
-        self.lookback_for_peak = int(config.get("lookback_for_peak", 720))  # 30 days
+        # Optimized trend detection - longer periods reduce whipsaws
+        self.short_ma = int(config.get("short_ma", 96))  # 4 days (was 2)
+        self.long_ma = int(config.get("long_ma", 336))  # 14 days (was 7)
+        
+        # Confirmation bars to avoid false breakouts
+        self.confirmation_bars = int(config.get("confirmation_bars", 3))
+        
+        # Exit conditions - wider to let profits run
+        self.max_drawdown_exit = float(config.get("max_drawdown_exit", 0.15))  # 15% drawdown
+        self.lookback_for_peak = int(config.get("lookback_for_peak", 336))  # 14 days
         
         self.rebalance_threshold = float(config.get("rebalance_threshold", 0.01))
         self.min_trade_notional = float(config.get("min_trade_notional", 200.0))
         
-        self._close_buffer: Deque[float] = deque(maxlen=self.lookback_for_peak + 10)
+        max_window = max(self.long_ma, self.lookback_for_peak) + 10
+        self._close_buffer: Deque[float] = deque(maxlen=max_window)
         self._last_timestamp: Optional[datetime] = None
         self._pending_side: Optional[str] = None
-        self._initial_entry_done: bool = False
+        self._bars_in_uptrend: int = 0  # Track consecutive uptrend bars
 
     def prepare(self) -> None:
         self._close_buffer.clear()
         self._last_timestamp = None
         self._pending_side = None
-        self._initial_entry_done = False
+        self._bars_in_uptrend = 0
 
     def _append_price(self, close: float) -> None:
         if close <= 0:
@@ -69,32 +77,66 @@ class MomentumRotatorStrategy(BaseStrategy):
         self._append_price(snapshot.current_price)
         self._last_timestamp = snapshot.timestamp
 
-    def _extreme_crash(self) -> bool:
-        """Only exit on extreme crashes: >40% drawdown from recent high."""
+    def _sma(self, period: int) -> float:
+        """Calculate simple moving average."""
+        if len(self._close_buffer) < period:
+            return sum(self._close_buffer) / len(self._close_buffer) if self._close_buffer else 0.0
+        recent = list(self._close_buffer)[-period:]
+        return sum(recent) / period
+
+    def _in_uptrend(self) -> bool:
+        """Check if market is in uptrend with confirmation."""
+        if len(self._close_buffer) < self.long_ma:
+            # During warmup, require stronger momentum (4% gain in last 96h)
+            if len(self._close_buffer) < 96:
+                return False
+            recent = list(self._close_buffer)[-96:]
+            return (recent[-1] / recent[0] - 1.0) > 0.04
+        
+        current_price = self._close_buffer[-1]
+        short = self._sma(self.short_ma)
+        long = self._sma(self.long_ma)
+        
+        # Basic uptrend: short MA > long MA and price > short MA
+        is_uptrend = short > long and current_price > short
+        
+        # Track consecutive uptrend bars
+        if is_uptrend:
+            self._bars_in_uptrend += 1
+        else:
+            self._bars_in_uptrend = 0
+        
+        return is_uptrend
+
+    def _drawdown_exit(self) -> bool:
+        """Exit if drawdown exceeds threshold OR price drops below long MA."""
         if len(self._close_buffer) < self.lookback_for_peak:
             return False
-        price = self._close_buffer[-1]
-        recent_high = max(list(self._close_buffer)[-self.lookback_for_peak:])
-        if recent_high <= 0:
+        
+        current = self._close_buffer[-1]
+        
+        # Exit if price falls below long-term MA (strong downtrend)
+        if len(self._close_buffer) >= self.long_ma:
+            long_ma = self._sma(self.long_ma)
+            if current < long_ma * 0.95:  # 5% below long MA
+                return True
+        
+        # Exit on large drawdown from recent peak
+        recent = list(self._close_buffer)[-self.lookback_for_peak:]
+        peak = max(recent)
+        
+        if peak <= 0:
             return False
-        drawdown = (recent_high - price) / recent_high
-        return drawdown > self.max_drawdown_exit
+        
+        drawdown = (peak - current) / peak
+        return drawdown >= self.max_drawdown_exit
 
     def generate_signal(self, market: MarketSnapshot, portfolio: Portfolio) -> Signal:
         self._update_buffers(market)
 
-        # Buy immediately on first opportunity
-        if not self._initial_entry_done and len(self._close_buffer) >= 1 and portfolio.quantity <= _EPS:
-            price = self._close_buffer[-1]
-            equity = max(portfolio.value(price), _EPS)
-            target_notional = equity * self.max_position_pct
-            size = target_notional / max(price, _EPS)
-            affordable = portfolio.cash / max(price, _EPS)
-            size = min(size, affordable)
-            if size > _EPS:
-                self._pending_side = "buy"
-                self._initial_entry_done = True
-                return Signal("buy", size=size, reason="immediate_buy")
+        # Need minimum data
+        if len(self._close_buffer) < 24:  # At least 1 day
+            return Signal("hold", reason="warming_up")
 
         if self._pending_side is not None:
             return Signal("hold", reason="await_fill")
@@ -104,13 +146,19 @@ class MomentumRotatorStrategy(BaseStrategy):
         current_notional = portfolio.quantity * price
         current_pct = current_notional / equity
 
-        # Default: stay fully invested, only exit on extreme crash
-        target_pct = self.max_position_pct
+        # Determine target position based on market conditions
+        target_pct = 0.0  # Default: cash
         
-        if portfolio.quantity > _EPS:
-            if self._extreme_crash():
-                target_pct = 0.0
-        # Note: We never re-enter after exiting (contest period too short for recoveries)
+        if self._in_uptrend():
+            # In uptrend: go long
+            target_pct = self.max_position_pct
+        elif portfolio.quantity > _EPS:
+            # Not in uptrend but have position: check if we should exit
+            if self._drawdown_exit():
+                target_pct = 0.0  # Exit on drawdown
+            else:
+                # Hold existing position even if not in perfect uptrend
+                target_pct = self.max_position_pct
 
         diff_pct = target_pct - current_pct
 
@@ -124,18 +172,20 @@ class MomentumRotatorStrategy(BaseStrategy):
         size = trade_notional / max(price, _EPS)
         
         if diff_pct > 0:
+            # Buy signal
             affordable = portfolio.cash / max(price, _EPS)
             size = min(size, affordable)
             if size <= _EPS:
                 return Signal("hold", reason="insufficient_cash")
             self._pending_side = "buy"
-            return Signal("buy", size=size, reason="entry")
+            return Signal("buy", size=size, reason="uptrend_entry")
 
+        # Sell signal
         size = min(size, portfolio.quantity)
         if size <= _EPS:
             return Signal("hold", reason="no_position")
         self._pending_side = "sell"
-        return Signal("sell", size=size, reason="extreme_crash_exit")
+        return Signal("sell", size=size, reason="trend_exit")
 
     def on_trade(self, signal: Signal, execution_price: float, execution_size: float, timestamp: datetime) -> None:
         if execution_size <= 0:
